@@ -4,7 +4,7 @@ Replaces the Mac-only `insert_dylib` tool — works on Windows, Linux, and Mac.
 
 This module can:
 - Parse Mach-O headers (single-arch and FAT/universal binaries)
-- Strip LC_CODE_SIGNATURE load commands
+- Strip LC_CODE_SIGNATURE load commands safely anywhere in the command list
 - Insert LC_LOAD_DYLIB load commands to load a dylib at runtime
 """
 
@@ -56,7 +56,7 @@ def _detect_format(data: bytes) -> tuple[str, bool]:
 def _is_fat(data: bytes) -> bool:
     """Check if binary is a FAT/universal binary."""
     magic = struct.unpack(">I", data[:4])[0]
-    return magic == FAT_MAGIC
+    return magic in (FAT_MAGIC, FAT_CIGAM)
 
 
 def _round_up(value: int, alignment: int) -> int:
@@ -80,96 +80,104 @@ def _process_single_macho(data: bytearray, offset: int, dylib_path: str, strip_c
             f"{endian}IiiIIII", data, offset
         )
 
-    Logger.debug(f"  Mach-O at offset 0x{offset:X}: {'64-bit' if is_64 else '32-bit'}, {ncmds} load commands, sizeofcmds={sizeofcmds}")
+    Logger.debug(
+        f"  Mach-O at offset 0x{offset:X}: {'64-bit' if is_64 else '32-bit'}, "
+        f"{ncmds} load commands, sizeofcmds={sizeofcmds}"
+    )
 
     commands_offset = offset + header_size
     lc_offset = commands_offset
 
-    # Walk load commands to find LC_CODE_SIGNATURE and check for existing dylib
     codesig_offset = -1
     codesig_cmdsize = 0
-    codesig_index = -1
-    first_segment_fileoff = -1
+    first_data_offset = len(data) - offset
 
-    for i in range(ncmds):
+    for _ in range(ncmds):
         cmd, cmdsize = struct.unpack_from(f"{endian}II", data, lc_offset)
 
-        # Check if this dylib is already loaded
-        if cmd == LC_LOAD_DYLIB or cmd == LC_LOAD_WEAK_DYLIB:
+        # Check if dylib is already loaded
+        if cmd in (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB):
             name_offset_val = struct.unpack_from(f"{endian}I", data, lc_offset + 8)[0]
             name_start = lc_offset + name_offset_val
-            name_end = data.index(0, name_start)
-            existing_name = data[name_start:name_end].decode("utf-8", errors="replace")
-            if existing_name == dylib_path:
-                Logger.warn(f"  Dylib '{dylib_path}' is already loaded, skipping")
-                return
+            name_end = data.find(0, name_start)
+            if name_end != -1:
+                existing_name = data[name_start:name_end].decode("utf-8", errors="replace")
+                if existing_name == dylib_path:
+                    Logger.warn(f"  Dylib '{dylib_path}' is already loaded, skipping")
+                    return
 
         # Track LC_CODE_SIGNATURE
         if cmd == LC_CODE_SIGNATURE:
             codesig_offset = lc_offset
             codesig_cmdsize = cmdsize
-            codesig_index = i
 
-        # Track first segment file offset (to know available space)
-        if cmd in (LC_SEGMENT, LC_SEGMENT_64):
-            if cmd == LC_SEGMENT_64:
-                seg_fileoff = struct.unpack_from(f"{endian}Q", data, lc_offset + 40)[0]
-            else:
-                seg_fileoff = struct.unpack_from(f"{endian}I", data, lc_offset + 36)[0]
-            if seg_fileoff > 0 and (first_segment_fileoff == -1 or seg_fileoff < first_segment_fileoff):
-                first_segment_fileoff = seg_fileoff
+        # Find earliest section offset to know where load commands end and actual data begins
+        if cmd == LC_SEGMENT_64:
+            nsects = struct.unpack_from(f"{endian}I", data, lc_offset + 64)[0]
+            sect_offset = lc_offset + 72
+            for _ in range(nsects):
+                soff = struct.unpack_from(f"{endian}I", data, sect_offset + 32)[0]
+                ssize = struct.unpack_from(f"{endian}Q", data, sect_offset + 24)[0]
+                if soff > 0 and ssize > 0 and soff < first_data_offset:
+                    first_data_offset = soff
+                sect_offset += 80
+        elif cmd == LC_SEGMENT:
+            nsects = struct.unpack_from(f"{endian}I", data, lc_offset + 48)[0]
+            sect_offset = lc_offset + 56
+            for _ in range(nsects):
+                soff = struct.unpack_from(f"{endian}I", data, sect_offset + 32)[0]
+                ssize = struct.unpack_from(f"{endian}I", data, sect_offset + 24)[0]
+                if soff > 0 and ssize > 0 and soff < first_data_offset:
+                    first_data_offset = soff
+                sect_offset += 68
 
         lc_offset += cmdsize
 
-    # Strip LC_CODE_SIGNATURE if found and requested
+    # Strip LC_CODE_SIGNATURE safely anywhere in the commands list
     if strip_codesig and codesig_offset != -1:
-        if codesig_index == ncmds - 1:
-            Logger.debug(f"  Stripping LC_CODE_SIGNATURE ({codesig_cmdsize} bytes)")
-            # Zero out the load command
-            for j in range(codesig_cmdsize):
-                data[codesig_offset + j] = 0
-            ncmds -= 1
-            sizeofcmds -= codesig_cmdsize
-        else:
-            Logger.warn("  LC_CODE_SIGNATURE is not the last load command, cannot strip safely")
+        Logger.debug(f"  Stripping LC_CODE_SIGNATURE ({codesig_cmdsize} bytes)")
+        tail_start = codesig_offset + codesig_cmdsize
+        tail_end = commands_offset + sizeofcmds
+        tail_len = tail_end - tail_start
+        if tail_len > 0:
+            data[codesig_offset : codesig_offset + tail_len] = data[tail_start:tail_end]
+        vacated_start = codesig_offset + tail_len
+        data[vacated_start : vacated_start + codesig_cmdsize] = b"\x00" * codesig_cmdsize
+        ncmds -= 1
+        sizeofcmds -= codesig_cmdsize
 
-    # Build the new LC_LOAD_DYLIB command
+    # Build new LC_LOAD_DYLIB command
     dylib_path_bytes = dylib_path.encode("utf-8") + b"\x00"
     new_cmdsize = _round_up(DYLIB_COMMAND_HEADER_SIZE + len(dylib_path_bytes), ptr_size)
 
-    # Check available space
+    # Check available header padding space
     end_of_commands = commands_offset + sizeofcmds
-    available_space = (first_segment_fileoff + offset if first_segment_fileoff > 0 else len(data)) - end_of_commands
+    available_space = (first_data_offset + offset) - end_of_commands
 
     if new_cmdsize > available_space:
         Logger.fatal(
-            f"  Not enough space to insert load command. "
-            f"Need {new_cmdsize} bytes, only {available_space} available. "
-            f"Try stripping code signature first with --strip-codesig."
+            f"  Not enough space in header padding to insert load command. "
+            f"Need {new_cmdsize} bytes, only {available_space} available."
         )
         return
 
-    # Write the new load command at end of current commands
+    # Write new load command at the end of load commands
     insert_offset = end_of_commands
     new_lc = bytearray(new_cmdsize)
-
-    struct.pack_into(f"{endian}I", new_lc, 0, LC_LOAD_DYLIB)  # cmd
-    struct.pack_into(f"{endian}I", new_lc, 4, new_cmdsize)  # cmdsize
-    struct.pack_into(f"{endian}I", new_lc, 8, DYLIB_COMMAND_HEADER_SIZE)  # name offset
-    struct.pack_into(f"{endian}I", new_lc, 12, 0)  # timestamp
-    struct.pack_into(f"{endian}I", new_lc, 16, 0)  # current_version
-    struct.pack_into(f"{endian}I", new_lc, 20, 0)  # compatibility_version
-
-    # Write the dylib path string
+    struct.pack_into(f"{endian}I", new_lc, 0, LC_LOAD_DYLIB)
+    struct.pack_into(f"{endian}I", new_lc, 4, new_cmdsize)
+    struct.pack_into(f"{endian}I", new_lc, 8, DYLIB_COMMAND_HEADER_SIZE)
+    struct.pack_into(f"{endian}I", new_lc, 12, 0)
+    struct.pack_into(f"{endian}I", new_lc, 16, 0)
+    struct.pack_into(f"{endian}I", new_lc, 20, 0)
     new_lc[DYLIB_COMMAND_HEADER_SIZE : DYLIB_COMMAND_HEADER_SIZE + len(dylib_path_bytes)] = dylib_path_bytes
 
-    # Insert into binary data
     data[insert_offset : insert_offset + new_cmdsize] = new_lc
 
-    # Update header: ncmds and sizeofcmds
     ncmds += 1
     sizeofcmds += new_cmdsize
 
+    # Update Mach-O header with new command count and total command size
     if is_64:
         struct.pack_into(f"{endian}II", data, offset + 16, ncmds, sizeofcmds)
     else:
@@ -192,7 +200,6 @@ def inject_dylib(binary_path: Path, dylib_path: str, strip_codesig: bool = True)
     data = bytearray(binary_path.read_bytes())
 
     if _is_fat(data):
-        # FAT/universal binary — process each architecture slice
         nfat_arch = struct.unpack(">I", data[4:8])[0]
         Logger.debug(f"FAT binary with {nfat_arch} architectures")
 
@@ -204,7 +211,6 @@ def inject_dylib(binary_path: Path, dylib_path: str, strip_codesig: bool = True)
             Logger.debug(f"  Slice {i}: cputype={cputype}, offset=0x{slice_offset:X}, size={slice_size}")
             _process_single_macho(data, slice_offset, dylib_path, strip_codesig)
     else:
-        # Single-arch binary
         _process_single_macho(data, 0, dylib_path, strip_codesig)
 
     binary_path.write_bytes(data)

@@ -62,6 +62,12 @@ class IPA:
         self.frameworks_dir = self.app_dir / "Frameworks"
         self.frameworks_dir.mkdir(exist_ok=True)
 
+        # Remove existing _CodeSignature to allow clean resigning
+        codesig_dir = self.app_dir / "_CodeSignature"
+        if codesig_dir.exists():
+            Logger.debug("Removing original _CodeSignature directory")
+            shutil.rmtree(codesig_dir, ignore_errors=True)
+
     def inject_gadget(
         self,
         gadget_dylib_path: Path,
@@ -102,14 +108,29 @@ class IPA:
         inject_dylib(self.executable_path, dylib_load_path, strip_codesig=True)
 
     def repackage(self, output_path: Path) -> None:
-        """Repackage the modified app bundle into a new IPA."""
+        """Repackage the modified app bundle into a new IPA with proper POSIX file permissions."""
         Logger.info(f"Repackaging IPA: {output_path.name}")
 
-        with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        # Ensure parent directory of output exists
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
             for file_path in self.temp_dir.rglob("*"):
                 if file_path.is_file():
                     arcname = file_path.relative_to(self.temp_dir).as_posix()
-                    zf.write(file_path, arcname)
+                    zinfo = zipfile.ZipInfo.from_file(file_path, arcname)
+
+                    # Preserve/set Unix execution permissions (+x for binaries and dylibs)
+                    is_executable = (
+                        file_path == self.executable_path
+                        or file_path.suffix.lower() in (".dylib", ".so")
+                        or "Frameworks/" in arcname
+                    )
+                    mode = 0o755 if is_executable else 0o644
+                    zinfo.external_attr = (mode & 0xFFFF) << 16
+
+                    with open(file_path, "rb") as src_f:
+                        zf.writestr(zinfo, src_f.read())
 
         size_mb = output_path.stat().st_size / 1024 / 1024
         Logger.info(f"Output IPA: {output_path} ({size_mb:.1f} MB)")
@@ -117,5 +138,5 @@ class IPA:
     def cleanup(self) -> None:
         """Remove temp directory."""
         if self.temp_dir.exists():
-            shutil.rmtree(self.temp_dir)
+            shutil.rmtree(self.temp_dir, ignore_errors=True)
             Logger.debug(f"Cleaned up: {self.temp_dir}")
