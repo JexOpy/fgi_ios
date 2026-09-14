@@ -31,7 +31,7 @@ Run `fgi-ios -h` to get options
 
 These configs are taken from [Frida website](https://frida.re)
 
-If you need to use other configuration options, such as using v8 runtime, consider using the `--config-path` option
+If you need to use other configuration options, such as changing `on_load` to `resume` or setting custom interaction parameters, consider using the `--config-path` option
 
 #### Examples
 
