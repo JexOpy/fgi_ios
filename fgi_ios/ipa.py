@@ -1,6 +1,6 @@
 """
 IPA file operations — extract, modify, and repackage iOS app bundles.
-Uses Python's built-in zipfile module (no external tools needed).
+Uses Python's built-in zipfile module with streaming I/O for minimal RAM footprint.
 """
 
 import plistlib
@@ -45,14 +45,18 @@ class IPA:
         if not info_plist_path.exists():
             Logger.fatal("Info.plist not found in app bundle")
 
-        with open(info_plist_path, "rb") as f:
-            info_plist = plistlib.load(f)
+        try:
+            with open(info_plist_path, "rb") as f:
+                info_plist = plistlib.load(f)
+        except Exception as e:
+            Logger.fatal(f"Failed to parse Info.plist: {e}")
+            raise
 
         executable_name = info_plist.get("CFBundleExecutable")
         if not executable_name:
             Logger.fatal("CFBundleExecutable not found in Info.plist")
 
-        self.executable_path = self.app_dir / executable_name
+        self.executable_path = self.app_dir / str(executable_name)
         if not self.executable_path.exists():
             Logger.fatal(f"Executable not found: {executable_name}")
 
@@ -62,7 +66,7 @@ class IPA:
         self.frameworks_dir = self.app_dir / "Frameworks"
         self.frameworks_dir.mkdir(exist_ok=True)
 
-        # Remove existing _CodeSignature to allow clean resigning
+        # Remove existing _CodeSignature to allow clean resigning without signature collisions
         codesig_dir = self.app_dir / "_CodeSignature"
         if codesig_dir.exists():
             Logger.debug("Removing original _CodeSignature directory")
@@ -108,16 +112,24 @@ class IPA:
         inject_dylib(self.executable_path, dylib_load_path, strip_codesig=True)
 
     def repackage(self, output_path: Path) -> None:
-        """Repackage the modified app bundle into a new IPA with proper POSIX file permissions."""
+        """
+        Repackage the modified app bundle into a new IPA.
+        Uses 1MB buffered chunk streaming to maintain minimal RAM usage even on multi-GB IPAs,
+        and sets Unix POSIX file attributes (0o755) for all executables and frameworks.
+        """
         Logger.info(f"Repackaging IPA: {output_path.name}")
 
-        # Ensure parent directory of output exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-            for file_path in self.temp_dir.rglob("*"):
-                if file_path.is_file():
-                    arcname = file_path.relative_to(self.temp_dir).as_posix()
+            for file_path in sorted(self.temp_dir.rglob("*")):
+                arcname = file_path.relative_to(self.temp_dir).as_posix()
+
+                if file_path.is_dir():
+                    zinfo = zipfile.ZipInfo(arcname + "/")
+                    zinfo.external_attr = (0o755 & 0xFFFF) << 16
+                    zf.writestr(zinfo, b"")
+                elif file_path.is_file():
                     zinfo = zipfile.ZipInfo.from_file(file_path, arcname)
 
                     # Preserve/set Unix execution permissions (+x for binaries and dylibs)
@@ -129,8 +141,9 @@ class IPA:
                     mode = 0o755 if is_executable else 0o644
                     zinfo.external_attr = (mode & 0xFFFF) << 16
 
-                    with open(file_path, "rb") as src_f:
-                        zf.writestr(zinfo, src_f.read())
+                    # Stream file in 1MB chunks to avoid memory spikes
+                    with open(file_path, "rb") as src_f, zf.open(zinfo, "w") as dest_f:
+                        shutil.copyfileobj(src_f, dest_f, length=1024 * 1024)
 
         size_mb = output_path.stat().st_size / 1024 / 1024
         Logger.info(f"Output IPA: {output_path} ({size_mb:.1f} MB)")

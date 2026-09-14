@@ -2,14 +2,18 @@
 Pure Python Mach-O binary manipulation.
 Replaces the Mac-only `insert_dylib` tool — works on Windows, Linux, and Mac.
 
-This module can:
-- Parse Mach-O headers (single-arch and FAT/universal binaries)
-- Strip LC_CODE_SIGNATURE load commands safely anywhere in the command list
-- Insert LC_LOAD_DYLIB load commands to load a dylib at runtime
+Features:
+- Zero-copy in-place memory-mapped I/O (mmap) for instant execution and minimal RAM usage.
+- Supports single-architecture and FAT / universal Mach-O binaries.
+- Strips LC_CODE_SIGNATURE load commands safely anywhere in the commands list.
+- Inserts LC_LOAD_DYLIB load commands into Mach-O header padding.
+- Accurately computes available header padding using Mach-O segment and section offsets.
 """
 
+import mmap
 import struct
 from pathlib import Path
+from typing import Union
 
 from fgi_ios.logger import Logger
 
@@ -37,6 +41,8 @@ FAT_HEADER_SIZE = 8  # 2 * uint32
 FAT_ARCH_SIZE = 20  # 5 * uint32
 DYLIB_COMMAND_HEADER_SIZE = 24  # cmd(4) + cmdsize(4) + name_offset(4) + timestamp(4) + current_version(4) + compat_version(4)
 
+MachoBuffer = Union[mmap.mmap, bytearray]
+
 
 def _detect_format(data: bytes) -> tuple[str, bool]:
     """Detect Mach-O format. Returns (endian_char, is_64bit)."""
@@ -53,7 +59,7 @@ def _detect_format(data: bytes) -> tuple[str, bool]:
         raise ValueError(f"Unknown Mach-O magic: 0x{magic:08X}")
 
 
-def _is_fat(data: bytes) -> bool:
+def _is_fat(data: MachoBuffer) -> bool:
     """Check if binary is a FAT/universal binary."""
     magic = struct.unpack(">I", data[:4])[0]
     return magic in (FAT_MAGIC, FAT_CIGAM)
@@ -64,8 +70,8 @@ def _round_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) & ~(alignment - 1)
 
 
-def _process_single_macho(data: bytearray, offset: int, dylib_path: str, strip_codesig: bool) -> None:
-    """Process a single Mach-O binary (within a FAT slice or standalone)."""
+def _process_single_macho(data: MachoBuffer, offset: int, dylib_path: str, strip_codesig: bool) -> None:
+    """Process a single Mach-O binary slice (within a FAT binary or standalone)."""
     endian, is_64 = _detect_format(bytes(data[offset : offset + 4]))
     header_size = MACH_HEADER_64_SIZE if is_64 else MACH_HEADER_SIZE
     ptr_size = 8 if is_64 else 4
@@ -99,7 +105,7 @@ def _process_single_macho(data: bytearray, offset: int, dylib_path: str, strip_c
         if cmd in (LC_LOAD_DYLIB, LC_LOAD_WEAK_DYLIB):
             name_offset_val = struct.unpack_from(f"{endian}I", data, lc_offset + 8)[0]
             name_start = lc_offset + name_offset_val
-            name_end = data.find(0, name_start)
+            name_end = data.find(b"\x00", name_start)
             if name_end != -1:
                 existing_name = data[name_start:name_end].decode("utf-8", errors="replace")
                 if existing_name == dylib_path:
@@ -111,22 +117,32 @@ def _process_single_macho(data: bytearray, offset: int, dylib_path: str, strip_c
             codesig_offset = lc_offset
             codesig_cmdsize = cmdsize
 
-        # Find earliest section offset to know where load commands end and actual data begins
+        # Find earliest file offset where actual segment/section code and data begin
         if cmd == LC_SEGMENT_64:
+            seg_fileoff = struct.unpack_from(f"{endian}Q", data, lc_offset + 40)[0]
+            seg_filesize = struct.unpack_from(f"{endian}Q", data, lc_offset + 48)[0]
+            if seg_fileoff > 0 and seg_filesize > 0 and seg_fileoff < first_data_offset:
+                first_data_offset = seg_fileoff
+
             nsects = struct.unpack_from(f"{endian}I", data, lc_offset + 64)[0]
             sect_offset = lc_offset + 72
             for _ in range(nsects):
-                soff = struct.unpack_from(f"{endian}I", data, sect_offset + 32)[0]
-                ssize = struct.unpack_from(f"{endian}Q", data, sect_offset + 24)[0]
+                ssize = struct.unpack_from(f"{endian}Q", data, sect_offset + 40)[0]
+                soff = struct.unpack_from(f"{endian}I", data, sect_offset + 48)[0]
                 if soff > 0 and ssize > 0 and soff < first_data_offset:
                     first_data_offset = soff
                 sect_offset += 80
         elif cmd == LC_SEGMENT:
+            seg_fileoff = struct.unpack_from(f"{endian}I", data, lc_offset + 32)[0]
+            seg_filesize = struct.unpack_from(f"{endian}I", data, lc_offset + 36)[0]
+            if seg_fileoff > 0 and seg_filesize > 0 and seg_fileoff < first_data_offset:
+                first_data_offset = seg_fileoff
+
             nsects = struct.unpack_from(f"{endian}I", data, lc_offset + 48)[0]
             sect_offset = lc_offset + 56
             for _ in range(nsects):
-                soff = struct.unpack_from(f"{endian}I", data, sect_offset + 32)[0]
-                ssize = struct.unpack_from(f"{endian}I", data, sect_offset + 24)[0]
+                ssize = struct.unpack_from(f"{endian}I", data, sect_offset + 36)[0]
+                soff = struct.unpack_from(f"{endian}I", data, sect_offset + 40)[0]
                 if soff > 0 and ssize > 0 and soff < first_data_offset:
                     first_data_offset = soff
                 sect_offset += 68
@@ -188,7 +204,7 @@ def _process_single_macho(data: bytearray, offset: int, dylib_path: str, strip_c
 
 def inject_dylib(binary_path: Path, dylib_path: str, strip_codesig: bool = True) -> None:
     """
-    Inject a dylib load command into a Mach-O binary.
+    Inject a dylib load command into a Mach-O binary using memory-mapped I/O.
 
     Args:
         binary_path: Path to the Mach-O binary to modify (modified in-place).
@@ -197,21 +213,24 @@ def inject_dylib(binary_path: Path, dylib_path: str, strip_codesig: bool = True)
     """
     Logger.info(f"Injecting dylib into: {binary_path.name}")
 
-    data = bytearray(binary_path.read_bytes())
+    with open(binary_path, "r+b") as fp:
+        with mmap.mmap(fp.fileno(), 0, access=mmap.ACCESS_WRITE) as mm:
+            if _is_fat(mm):
+                nfat_arch = struct.unpack(">I", mm[4:8])[0]
+                Logger.debug(f"FAT binary with {nfat_arch} architectures")
 
-    if _is_fat(data):
-        nfat_arch = struct.unpack(">I", data[4:8])[0]
-        Logger.debug(f"FAT binary with {nfat_arch} architectures")
+                for i in range(nfat_arch):
+                    arch_offset = FAT_HEADER_SIZE + i * FAT_ARCH_SIZE
+                    cputype, cpusubtype, slice_offset, slice_size, align = struct.unpack_from(
+                        ">iiIII", mm, arch_offset
+                    )
+                    Logger.debug(
+                        f"  Slice {i}: cputype={cputype}, offset=0x{slice_offset:X}, size={slice_size}"
+                    )
+                    _process_single_macho(mm, slice_offset, dylib_path, strip_codesig)
+            else:
+                _process_single_macho(mm, 0, dylib_path, strip_codesig)
 
-        for i in range(nfat_arch):
-            arch_offset = FAT_HEADER_SIZE + i * FAT_ARCH_SIZE
-            cputype, cpusubtype, slice_offset, slice_size, align = struct.unpack_from(
-                ">iiIII", data, arch_offset
-            )
-            Logger.debug(f"  Slice {i}: cputype={cputype}, offset=0x{slice_offset:X}, size={slice_size}")
-            _process_single_macho(data, slice_offset, dylib_path, strip_codesig)
-    else:
-        _process_single_macho(data, 0, dylib_path, strip_codesig)
+            mm.flush()
 
-    binary_path.write_bytes(data)
     Logger.info("Binary patched successfully")

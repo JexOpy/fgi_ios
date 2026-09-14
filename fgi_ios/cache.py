@@ -3,6 +3,8 @@ import lzma
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from fgi_ios.logger import Logger
 
@@ -11,11 +13,27 @@ FRIDA_RELEASES_TAG = "https://api.github.com/repos/frida/frida/releases/tags/%s"
 GADGET_ASSET_NAME = "frida-gadget-%s-ios-universal.dylib.xz"
 
 
+def _create_http_session() -> requests.Session:
+    """Create a requests session with automatic retries for robust downloading."""
+    session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
 class Cache:
     def __init__(self) -> None:
         self.home = Path.home() / ".fgi-ios"
         self.metadata_path = self.home / "metadata.json"
         self._metadata: dict[str, str] = {}
+        self._session = _create_http_session()
 
     def ensure(self) -> None:
         """Ensure cache directory and metadata file exist."""
@@ -70,13 +88,12 @@ class Cache:
     def _resolve_latest_version(self) -> str:
         Logger.info("Resolving latest Frida version...")
         try:
-            resp = requests.get(FRIDA_RELEASES_LATEST, timeout=15)
+            resp = self._session.get(FRIDA_RELEASES_LATEST, timeout=15)
             if resp.status_code == 200:
                 version = resp.json()["tag_name"]
                 Logger.info(f"Latest Frida version: {version}")
                 return version
             elif resp.status_code == 403:
-                # GitHub rate limit reached — try falling back to existing cache
                 cached_gadget = self.get_cached_gadget_path()
                 if cached_gadget:
                     Logger.warn("GitHub API rate limit exceeded. Falling back to cached FridaGadget.")
@@ -85,7 +102,6 @@ class Cache:
             else:
                 resp.raise_for_status()
         except requests.RequestException as e:
-            # Network issue — fallback to cached if available
             cached_gadget = self.get_cached_gadget_path()
             if cached_gadget:
                 Logger.warn(f"Could not reach GitHub ({e}). Falling back to cached FridaGadget.")
@@ -106,7 +122,7 @@ class Cache:
         tmp_path = version_dir / "FridaGadget.dylib.tmp"
 
         try:
-            with requests.get(url, stream=True, timeout=60) as resp:
+            with self._session.get(url, stream=True, timeout=60) as resp:
                 resp.raise_for_status()
                 Logger.info("Decompressing gadget stream...")
                 decompressor = lzma.LZMADecompressor()

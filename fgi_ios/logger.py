@@ -1,5 +1,4 @@
 import sys
-
 import colorama
 
 
@@ -8,7 +7,7 @@ class Logger:
 
     @staticmethod
     def initialize(verbose: bool) -> None:
-        colorama.init()
+        colorama.init(autoreset=True)
         Logger._verbose = verbose
 
     @staticmethod
