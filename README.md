@@ -1,138 +1,72 @@
-### frida-gadget injector for iOS (fgi-ios)
+### frida-gadget injector (fgi-ios)
+Another frida-gadget injector for IPA:
 
-Another frida-gadget injector, built specifically for iOS IPA files:
-
-* Windows, Linux & macOS support (pure Python Mach-O parser/injector — **no Mac, Xcode, or `insert_dylib` tool required**)
-* Automatically downloads and caches FridaGadget iOS universal releases from GitHub
-* Built-in configs (`listen`, `connect`, `script`) that save a lot of (copy/paste) time
-* Injects `@executable_path/Frameworks/<library_name>` `LC_LOAD_DYLIB` load commands into Mach-O 64-bit binaries
-* Strips code signature load commands (`LC_CODE_SIGNATURE`) automatically to allow sideloading
-* Can rename frida-gadget and script files to bypass detection by name
-* Clean extraction, patching, and repackaging of `.ipa` archives using standard libraries
+* Windows & Linux support
+* Automatically downloads and updates dependencies
+* Injects frida-gadget into iOS IPA Mach-O binaries
+* Built-in configs that save a lot of (copy/paste) time
+* Can rename frida-gadget and script libraries to bypass detection by name
+* Pure Python implementation without needing macOS or insert_dylib
 
 ### Installing
 
-```bash
-pip install git+https://github.com/JexOpy/fgi_ios.git
-```
+#### Windows (tested on Windows 11)
 
-Or clone and install locally:
+* Run `pip install git+https://github.com/JexOpy/fgi_ios`
+* Restart current cmd/powershell/terminal session
 
-```bash
-git clone https://github.com/JexOpy/fgi_ios.git
-cd fgi_ios
-pip install -e .
-```
+#### Linux
+
+* Run `pip install git+https://github.com/JexOpy/fgi_ios`
+  * Add `--break-system-packages` if pip refuses to install
+* Add `~/.local/bin` to path
 
 ### Usage
 
-Run `fgi-ios -h` to view all options:
+**NOTE**: On linux if you're using `/tmp` for temp files and working with large IPA, remount tmpfs using `mount -o remount,size=4G /tmp`
 
-```
-usage: fgi-ios [-h] -i INPUT [-o OUT] [-t {listen,connect,script}]
-               [-c CONFIG_PATH] [-l SCRIPT_PATH] [-n LIBRARY_NAME]
-               [-s SCRIPT_NAME] [-r TEMP_ROOT_PATH] [--no-cleanup]
-               [--frida-version FRIDA_VERSION] [--gadget-path GADGET_PATH]
-               [--offline-mode] [--no-cache] [-v]
-
-Frida Gadget Injector for iOS — inject FridaGadget into IPA files
-
-options:
-  -h, --help            show this help message and exit
-  -i, --input INPUT     Target IPA file
-  -o, --out OUT         Output IPA file
-  -t, --config-type {listen,connect,script}
-                        Target config type (default: listen)
-  -c, --config-path CONFIG_PATH
-                        Custom config path
-  -l, --script-path SCRIPT_PATH
-                        Script path (e.g. agent.js)
-  -n, --library-name LIBRARY_NAME
-                        frida-gadget library name (default: FridaGadget.dylib, must end with .dylib)
-  -s, --script-name SCRIPT_NAME
-                        frida-gadget script name (default: agent.js)
-  -r, --temp-root-path TEMP_ROOT_PATH
-                        Root path where temporary directory will be created
-  --no-cleanup          Do not remove temporary directory (useful for debugging)
-  --frida-version FRIDA_VERSION
-                        Specific frida version (e.g 16.7.19)
-  --gadget-path GADGET_PATH
-                        Use a local FridaGadget.dylib
-  --offline-mode        Disable updates check for deps / use cached gadget only
-  --no-cache            Force re-download of FridaGadget
-  -v, --verbose         Verbose logging (useful for debugging)
-```
-
-#### Examples
-
-**Basic injection (listen mode):**
-```bash
-fgi-ios -i target.ipa
-```
-Output IPA will be generated at `./target.patched.ipa`.
-
-**Script mode (auto-run Frida script on app launch):**
-```bash
-fgi-ios -i target.ipa -t script -l agent.js
-```
-
-**Bypass detection by renaming gadget and script:**
-```bash
-fgi-ios -i target.ipa -t script -l agent.js -n UnityFramework.dylib -s UnityFramework.js
-```
-
-**Specify custom output path:**
-```bash
-fgi-ios -i target.ipa -t script -l agent.js -o patched.ipa
-```
+Run `fgi-ios -h` to get options
 
 #### Built-in configs
 
-These configs are taken from [Frida Gadget documentation](https://frida.re/docs/gadget/):
+These configs are taken from [Frida website](https://frida.re)
 
-* **`listen`** (default):
-```json
-{
-  "interaction": {
-    "type": "listen",
-    "address": "0.0.0.0",
-    "port": 27042,
-    "on_port_conflict": "fail",
-    "on_load": "wait"
-  }
-}
-```
+If you need to use other configuration options, such as using v8 runtime, consider using the `--config-path` option
 
-* **`connect`**:
-```json
-{
-  "interaction": {
-    "type": "connect",
-    "address": "0.0.0.0",
-    "port": 27052
-  }
-}
-```
+#### Examples
 
-* **`script`**:
-```json
-{
-  "interaction": {
-    "type": "script",
-    "path": "agent.js"
-  }
-}
-```
+1. `fgi-ios -i target.ipa` - inject frida-gadget into target.ipa with **listen** mode
 
-### Signing / Sideloading
+2. `fgi-ios -i target.ipa -o out.ipa` - same as 1 + ready IPA will be named `out.ipa` instead of `target.patched.ipa`
 
-After patching, you will need to sign the output `.ipa` file using your preferred sideloading tool:
-- **TrollStore** (no re-signing needed on supported iOS versions)
-- **AltStore**
-- **Sideloadly**
-- **iOS App Signer** / **xcrun codesign**
+3. `fgi-ios -i target.ipa --frida-version 16.7.19` - use specific version (16.7.19) of frida-gadget instead of the latest one
+
+4. `fgi-ios -i target.ipa --offline-mode` - inject frida-gadget into target.ipa with **listen** mode and **skip frida-gadget update check**
+
+5. `fgi-ios -i target.ipa -t script -l index.js` - inject frida-gadget into target.ipa with `index.js` as **script**
+
+6. `fgi-ios -i target.ipa -c myconfig.json -r .` - inject frida-gadget into target.ipa with **myconfig.json** config and current directory as parent temporary directory **(DANGEROUS, current directory will be filled with temp files)**
+    * `fgi-ios` **will check does config require script and raise exception** if no `-l` option provided
+    * Parent temporary directory **also will be checked**
+
+7. `fgi-ios -i target.ipa -t script -l index.js -n libnotafrida.dylib -s libnotascript.js` - same as 1, but use **script** type + rename frida-gadget into `libnotafrida.dylib` and script into `libnotascript.js`
+    * Frida-gadget library name **must end with** `.dylib`
+
+8. `fgi-ios -i target.ipa --config-type listen --no-cleanup -v` - same as 1 + do **NOT** remove temporary directory and enable debug logs
+    * Temporary directory can be found using log message:
+
+    ```
+    Temp directory kept: /tmp/whatever...
+                         ~~~~~~~~~~~~~
+                             Here
+    ```
 
 ### Acknowledgements
 
-- Inspired by [fgi](https://github.com/commonuserlol/fgi) by commonuserlol.
-- [Frida](https://frida.re/) by Ole André Vadla Ravnås.
+[fgi](https://github.com/commonuserlol/fgi) - Original frida-gadget injector for APK
+
+### License
+
+This repository is licensed under a GNU General Public v3 License.
+
+See [LICENSE](LICENSE) file for details
