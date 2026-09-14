@@ -1,5 +1,5 @@
 [project]
-name = "fgi-ios"
+name = "fgi_ios"
 version = "1.0.0"
 description = "Frida Gadget Injector for iOS — inject FridaGadget into IPA files"
 requires-python = ">= 3.10"
